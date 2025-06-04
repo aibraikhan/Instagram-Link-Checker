@@ -1,0 +1,38 @@
+.link-badge {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-left: 4px;
+    vertical-align: middle;
+    background-color: gray; /* по умолчанию */
+    transition: all 0.2s ease;
+    cursor: default;
+}
+
+/* Тултип (опционально) */
+.link-badge::after {
+    content: attr(data-link-status);
+    display: inline-block;
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    padding-left: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.link-badge:hover {
+    width: auto;
+    height: auto;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background-color: rgba(0, 0, 0, 0.8);
+    overflow: visible;
+}
+
+.link-badge:hover::after {
+    opacity: 1;
+}

@@ -1,0 +1,13 @@
+{
+    "manifest_version": 3,
+    "name": "Instagram Link Checker",
+    "version": "0.1",
+    "description": "Добавляет пометки к ссылкам на страницах Instagram.",
+    "content_scripts": [
+        {
+        "matches": ["*://*.instagram.com/*"],
+        "js": ["content.js"],
+        "css": ["style.css"]
+        }
+    ]
+}
