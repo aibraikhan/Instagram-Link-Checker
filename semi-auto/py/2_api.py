@@ -5,13 +5,15 @@ import joblib
 import numpy as np
 import re
 import string
-import hashlib
+import hmac, hashlib
 from urllib.parse import urlparse
 from tldextract import extract as tld_extract
 import pandas as pd
+import os
 
 app = Flask(__name__)
-CORS(app, resources={r"/check_url": {"origins": "*"}})
+CORS(app, resources={r"/check_url": {"origins": ["chrome-extension://oaimmjgfajelaekcjlcpeedpcbpbchod"]}})
+
 
 # 1) Загрузка вашего “белого” списка (те самые ~1 000 000 доменов)
 WHITELIST_DF = pd.read_csv('whitelist.csv')
@@ -118,20 +120,42 @@ except FileNotFoundError:
     print("Error: best_model_v2.sav not found.")
     exit(1)
 
+API_TOKEN = os.environ.get("API_TOKEN")
+if not API_TOKEN:
+    raise RuntimeError("Переменная API_TOKEN не задана в окружении")
+
+def sign_response(payload: dict) -> str:
+    """
+    Считает HMAC-SHA256 hex-подпись от JSON-строки payload,
+    ключ — API_TOKEN.
+    """
+    import json, os
+    secret = os.environ['API_TOKEN'].encode()
+    msg    = json.dumps(payload, sort_keys=True).encode()
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
 # --- Основной endpoint ---
 @app.route('/check_url', methods=['POST'])
 @cross_origin()
 def check_url():
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {API_TOKEN}":
+        return jsonify({"error":"unauthorized"}), 401
+
     data = request.get_json(force=True) or {}
     url = data.get('url')
     if not url:
         return jsonify({'error': 'URL not provided'}), 400
 
+
     # 1) Сначала проверка по whitelist
     full_dom = extract_full_domain(url)
     if full_dom in WHITELIST_SET:
-        # Разумеется, если домен есть в белом списке — сразу benign
-        return jsonify({'status': 'benign', 'source': 'whitelist'}), 200
+        # формируем результат и подписываем
+        result = {'status': 'benign', 'source': 'whitelist'}
+        result['signature'] = sign_response(result)
+        return jsonify(result), 200
 
     # 2) Если домена нет в белом списке — прогоняем через модель
     try:
@@ -140,7 +164,10 @@ def check_url():
         pred_int = pipeline.predict(arr)[0]
         label_map = {0: 'benign', 1: 'defacement', 2: 'phishing', 3: 'malware'}
         status = label_map.get(int(pred_int), 'unknown')
-        return jsonify({'status': status, 'source': 'model'}), 200
+        result = {'status': status, 'source': 'model'}
+        # добавляем подпись именно от этих полей
+        result['signature'] = sign_response(result)
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

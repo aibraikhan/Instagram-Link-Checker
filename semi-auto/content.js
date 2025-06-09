@@ -1,135 +1,182 @@
 // content.js
 
-// 1) Строгая регулярка: ловит ровно "домен(.суффикс)(/путь)?" + необязательный http(s) и ничего кроме него.
-//    Примеры попаданий: "kazindoor.kz", "sub.example.com/path", "https://google.com".
-//    Примеры непропаданий: "hello world", "kazindoor", " kazindoor.kz extra " и т.п.
-const urlRegex = /^((https?:\/\/)?([A-Za-z0-9-]+\.)+[A-Za-z]{2,6}(\/\S*)?)$/i;
+// 0) Паттерн для поиска URL-подстрок в любом тексте
+const inlineUrlPattern = /((?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,6}(?:\/\S*)?)/g;
 
-// 2) Настройка вашего локального API
-const API_ENDPOINT = 'http://127.0.0.1:5000/check_url';
-async function checkLink(url) {
+// 1) Общий тултип
+const tooltip = document.createElement('div');
+tooltip.id = 'link-tooltip';
+// кнопка обновления добавится динамически
+document.body.appendChild(tooltip);
+
+
+// 2) Нормализация и проверка “тут ли URL” (для чистых узлов, оставлено как есть)
+function parseIfUrl(txt) {
+    const trimmed = txt.trim();
+    if (!trimmed || !trimmed.includes('.')) return null;
     try {
-        const res = await fetch(API_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url }),
-        });
-        const data = await res.json();
-        return data.status || 'unknown';
-    } catch (err) {
-        console.error('Ошибка при checkLink:', err);
-        return 'unknown';
+        const url = /^https?:\/\//i.test(trimmed)
+            ? new URL(trimmed)
+            : new URL('https://' + trimmed);
+        const norm = url.href.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+        const raw  = trimmed.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+        return norm === raw ? url : null;
+    } catch {
+        return null;
     }
 }
 
-// 3) Функция-помощник, которая для данного текстового узла (Node.TEXT_NODE) возвращает его родительский элемент,
-//    если этот текстовый узел «листьевой» (то есть он целиком совпадает с urlRegex и не содержит пробелов),
-//    а также этот родитель ещё не обработан (нет data-link-processed).
-function processTextNodeIfUrl(textNode) {
-    const txtRaw = textNode.nodeValue;
-    if (!txtRaw) return null;
-    const txt = txtRaw.trim();
-    const m = txt.match(urlRegex);
-    if (!m || m[0] !== txt) {
-        // Не целиком URL → ничего не делаем
-        return null;
-    }
-
-    const parent = textNode.parentElement;
-    if (!parent) return null;
-
-  // 3.1) Проверяем, что внутри parent нет уже наших бейджей:
-    if (parent.dataset.linkProcessed === 'true') {
-        return null;
-    }
-
-  // 3.2) Проверяем: родительский элемент НЕ должен иметь других узлов кроме этого textNode + (в будущем) бейджа.
-  // Например, если внутри родителя есть дополнительный <span>foo</span> после текста,
-  // то parent.textContent даст что-то вроде "kazindoor.kzfoo", не совпадающее с urlRegex.
-  // Но TreeWalker сработал на leaf textNode = "kazindoor.kz", и это безопасно.
-  //
-  // Другими словами, мы убеждаемся, что textNode — единственный «нескрытый» текст в этом parent.
-    const siblings = Array.from(parent.childNodes).filter(node => {
-        // Если это текстовый узел, проверим, есть ли в нем символы кроме пробелов
-        if (node.nodeType === Node.TEXT_NODE) {
-            return node.nodeValue.trim() !== '';
-        }
-        // Если это элемент (например, <span class="link-badge">), его мы тоже учитываем,
-        // но мы его ещё не вставляли (его не будет при первой проверке).
-        return node.nodeType === Node.ELEMENT_NODE && !node.classList.contains('link-badge');
+// 3) Отправка на проверку в background
+function checkLink(url) {
+    return new Promise(resolve => {
+        chrome.runtime.sendMessage(
+            { action: 'checkLink', url },
+            response => resolve(response?.status || 'unknown')
+        );
     });
+}
 
-  // Если помимо нашего TEXT_NODE в parent есть хоть ещё один «не бейджевой» дочерний узел — откажемся,
-  // потому что это значит, что parent содержит не только «kazindoor.kz», а, например, «kazindoor.kz extra»,
-  // либо «<span>kazindoor.kz</span><span>что-то ещё</span>», поэтому не целиком URL.
-    if (siblings.length > 1) {
-        return null;
+// 4) Обёртываем inline-URL-подстроки в span[data-link-processed]
+function markInlineLinks(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let node;
+    while (node = walker.nextNode()) {
+        // пропускаем уже обработанные
+        if (node.parentElement.matches('span[data-link-processed]')) continue;
+        if (inlineUrlPattern.test(node.nodeValue)) {
+            textNodes.push(node);
+        }
     }
 
-  // Всё ок — возвращаем parent, чтобы туда вставить бейдж
+    for (const textNode of textNodes) {
+        const parent = textNode.parentNode;
+        const text   = textNode.nodeValue;
+        inlineUrlPattern.lastIndex = 0;
+        const frag = document.createDocumentFragment();
+        let lastIdx = 0, m;
+        while (m = inlineUrlPattern.exec(text)) {
+            // текст до URL
+            if (m.index > lastIdx) {
+                frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+            }
+
+            // проверяем, а действительно ли это URL?
+            const candidate = m[0];
+            const parsed    = parseIfUrl(candidate);
+            if (parsed) {
+                // да — настоящий URL
+                const urlSpan = document.createElement('span');
+                urlSpan.textContent           = candidate;
+                urlSpan.dataset.linkProcessed = 'true';
+                urlSpan.dataset.linkUrl       = parsed.href.replace(/\/$/, '');
+                frag.appendChild(urlSpan);
+            } else {
+                // нет — просто вставляем текст как есть
+                frag.appendChild(document.createTextNode(candidate));
+            }
+
+            lastIdx = inlineUrlPattern.lastIndex;
+        }
+        // остаток после последнего URL
+        if (lastIdx < text.length) {
+            frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+        }
+        parent.replaceChild(frag, textNode);
+    }
+}
+
+// 5) Помощник для «чистых» узлов-URL
+function processTextNodeIfUrl(textNode) {
+    const parent = textNode.parentElement;
+    if (!parent || parent.dataset.linkProcessed) return null;
+
+    // Проверяем, что весь текст в узле — потенциальный URL
+    const urlObj = parseIfUrl(textNode.nodeValue);
+    if (!urlObj) return null;
+
+    // Убеждаемся, что в parent нет другого «живого» текста
+    const others = Array.from(parent.childNodes).filter(n =>
+        n !== textNode &&
+        n.nodeType === Node.TEXT_NODE &&
+        n.nodeValue.trim()
+    );
+    if (others.length) return null;
+
+    // Всё ок — возвращаем parent и домен для дальнейшей проверки
+    parent.dataset.linkProcessed = 'true';
+    parent.dataset.linkUrl = urlObj.href.replace(/\/$/, '');
     return parent;
 }
 
-// 4) Основная функция: обходим все текстовые узлы (TreeWalker) и вставляем бейджи в те, что должны.
+// 6) Вставляем бейджи для всех span[data-link-processed]
 async function addLinkBadges() {
-  // 4.1) Создаём TreeWalker, который проходит по всем текстовым узлам на странице:
-    const walker = document.createTreeWalker(
-        document.body,
-        NodeFilter.SHOW_TEXT,
-        null,
-        false
-    );
+    try{
+        // сначала обрабатываем inline ссылки
+        markInlineLinks(document.body);
 
-    let node;
-    while ((node = walker.nextNode())) {
-        // Для каждого текстового узла пытаемся получить «родительский URL-контейнер»
-        const parentContainer = processTextNodeIfUrl(node);
-        if (!parentContainer) continue;
+        // а теперь проходим по уже размеченным span
+        const spans = document.querySelectorAll('span[data-link-processed]');
+        for (const span of spans) {
+            if (span.dataset.linkChecked) continue;
+            span.dataset.linkChecked = 'true';
 
-        // 4.2) Теперь мы уверены: parentContainer — именно тот <span> или <div> или <a>,
-        //      внутри которого единственный текст — «kazindoor.kz» (или любой другой домен).
-        //      Вставляем бейдж внутрь parentContainer:
-        parentContainer.dataset.linkProcessed = 'true';
-        const badge = document.createElement('span');
-        badge.classList.add('link-badge');
-        badge.style.backgroundColor = 'gray'; // по умолчанию серый
+            const badge = document.createElement('span');
+            badge.classList.add('link-badge');
+            span.appendChild(badge);
 
-        // appendChild поместит бейдж после текстового узла внутри родителя
-        parentContainer.appendChild(badge);
+            // ключевая поправка: берем домен из dataset того же контейнера
+            const urlToCheck = span.dataset.linkUrl;
+            console.log('▶️ addLinkBadges(), checking URL:', urlToCheck);
 
-        // 4.3) Асинхронно запрашиваем статус у сервера и меняем цвет бейджа:
-        (async () => {
-            const status = await checkLink(node.nodeValue.trim());
+            const resp = await checkLink(urlToCheck);
+            console.log('⬅️ checkLink response for', urlToCheck, '→', resp);
+            console.log('checkLink returned:', resp);
+            // если resp — объект, достаём поле status
+            const status = (resp && typeof resp === 'object' && 'status' in resp)
+                ? resp.status
+                : resp;
             badge.dataset.linkStatus = status;
 
-            switch (status) {
-                case 'benign':
-                    badge.style.backgroundColor = 'green';
-                    break;
-                case 'phishing':
-                case 'malware':
-                    badge.style.backgroundColor = 'red';
-                    break;
-                case 'defacement':
-                case 'suspicious':
-                    badge.style.backgroundColor = 'orange';
-                    break;
-                default:
-                    badge.style.backgroundColor = 'gray';
-            }
-        })();
+            badge.addEventListener('mouseenter', () => {
+                const status = badge.dataset.linkStatus || 'unknown';
+                tooltip.textContent      = status;
+                tooltip.style.background = ({
+                    benign:    'green',
+                    phishing:  'red',
+                    defacement:'orange',
+                    malware:   'red',
+                    unknown:   'grey'
+                })[status] || 'grey';
+                tooltip.style.display = 'block';
+
+                const r    = badge.getBoundingClientRect();
+                let top    = r.top - tooltip.offsetHeight - 6;
+                if (top < 4) top = r.bottom + 6;
+                let left   = r.left + (r.width - tooltip.offsetWidth)/2;
+                if (left < 4) left = 4;
+                if (left + tooltip.offsetWidth > window.innerWidth - 4) {
+                    left = window.innerWidth - tooltip.offsetWidth - 4;
+                }
+                tooltip.style.left = `${left}px`;
+                tooltip.style.top  = `${top}px`;
+            });
+            badge.addEventListener('mouseleave', () => {
+                tooltip.style.display = 'none';
+            });
+        }
+    } catch (err) {
+        console.error('addLinkBadges failed:', err);
     }
 }
 
-// 5) После того как страница «грузится», сразу запускаем addLinkBadges() и вешаем MutationObserver,
-//    чтобы при появлении новых комментариев (или при переработке DOM) снова вызывать ту же функцию:
-window.addEventListener('load', () => {
-    addLinkBadges();
+// 7) Debounce + наблюдение за DOM
+let badgeTimer;
+function scheduleBadges() {
+    clearTimeout(badgeTimer);
+    badgeTimer = setTimeout(addLinkBadges, 150);
+}
 
-    const observer = new MutationObserver(() => {
-        // При любых изменениях в subtree тела документа вызываем addLinkBadges,
-        // чтобы захватить вновь появившиеся текстовые узлы-домены.
-        addLinkBadges();
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-});
+window.addEventListener('load', scheduleBadges);
+new MutationObserver(scheduleBadges)
+    .observe(document.body, { childList: true, subtree: true });

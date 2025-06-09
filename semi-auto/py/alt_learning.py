@@ -35,10 +35,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
-import whois
-import nltk
-import gensim
+
 
 from difflib import SequenceMatcher
 
