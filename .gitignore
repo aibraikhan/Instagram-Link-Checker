@@ -5,4 +5,4 @@
 
 # Игнорировать файл background.js внутри папки semi-auto
 /project/background.js
-/results/
+/results/*

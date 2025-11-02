@@ -9,6 +9,14 @@ tooltip.id = 'link-tooltip';
 // кнопка обновления добавится динамически
 document.body.appendChild(tooltip);
 
+function normalizeUrl(url) {
+    // Проверяем наличие схемы https:// или http://, если нет, добавляем https://
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'https://' + url;
+    }
+    return url;
+}
+
 
 // 2) Нормализация и проверка “тут ли URL” (для чистых узлов, оставлено как есть)
 function parseIfUrl(txt) {
