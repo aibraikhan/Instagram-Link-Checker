@@ -3,8 +3,6 @@
 
 /.venv/
 
-# Игнорировать папку testing
-/testing/
-
 # Игнорировать файл background.js внутри папки semi-auto
-/semi-auto/background.js
+/project/background.js
+/results/
