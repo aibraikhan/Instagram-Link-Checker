@@ -1,8 +1,9 @@
 *.sav
 *.csv
+*.npy
 
 /.venv/
+/results/
 
-# Игнорировать файл background.js внутри папки semi-auto
 /project/background.js
-/results/*
+/project/py/re-learning/tokenizer.json
