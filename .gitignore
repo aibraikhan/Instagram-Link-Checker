@@ -1,6 +1,7 @@
 *.sav
 *.csv
 *.npy
+*.pkl
 
 /.venv/
 /results/

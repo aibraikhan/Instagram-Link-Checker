@@ -154,6 +154,7 @@ async function addLinkBadges() {
                     phishing:  'red',
                     defacement:'orange',
                     malware:   'red',
+                    malicious: 'red',
                     unknown:   'grey'
                 })[status] || 'grey';
                 tooltip.style.display = 'block';

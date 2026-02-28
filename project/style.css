@@ -16,6 +16,7 @@
 .link-badge[data-link-status="phishing"]  { background-color: red; }
 .link-badge[data-link-status="defacement"]{ background-color: orange; }
 .link-badge[data-link-status="malware"]   { background-color: red; }
+.link-badge[data-link-status="malicious"]   { background-color: red; }
 .link-badge[data-link-status="unknown"],
 .link-badge:not([data-link-status])       { background-color: grey; }
 
