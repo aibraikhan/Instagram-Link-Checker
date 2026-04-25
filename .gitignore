@@ -2,9 +2,9 @@
 *.csv
 *.npy
 *.pkl
+*.png
 
 /.venv/
 /results/
 
 /project/background.js
-/project/py/re-learning/tokenizer.json

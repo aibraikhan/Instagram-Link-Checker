@@ -1,15 +1,16 @@
-# 2_api.py
-from flask import Flask, json, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
 import joblib
 import numpy as np
 import hmac, hashlib
 import os
 import torch
-from transformers import AutoTokenizer, AutoModel
-import pandas as pd
-import re
 import warnings
+import pandas as pd
+from transformers import AutoTokenizer, AutoModel
+from features import get_feature_vector
+import tldextract
+
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
@@ -17,105 +18,108 @@ EXT_ID = os.environ.get("EXTENSION_ID", "")
 if EXT_ID:
     CORS(app, resources={r"/check_url": {"origins": [f"chrome-extension://{EXT_ID}"]}})
 else:
-    CORS(app)  # dev fallback
+    CORS(app)
 
-# --- 1. ЗАГРУЗКА ГИБРИДНОЙ МОДЕЛИ ---
-MODEL_PATH = "./project/py/best_ensemble_model.pkl" 
+# --- 1. ЗАГРУЗКА МОДЕЛИ И СКЕЙЛЕРА ---
+MODEL_PATH  = "../project/brains/best_hybrid_ensemble.pkl"
+SCALER_PATH = "../project/brains/manual_feature_scaler.pkl"
+
 try:
     pipeline = joblib.load(MODEL_PATH)
-    print("✅ Гибридная модель (Ансамбль) успешно загружена!")
-except FileNotFoundError:
-    print(f"❌ Ошибка: Модель не найдена по пути {MODEL_PATH}")
-    exit(1)
+    scaler   = joblib.load(SCALER_PATH)
+    print("✅ Модель и скейлер загружены!")
+except FileNotFoundError as e:
+    print(f"❌ Файл не найден: {e}"); exit(1)
 
-# --- 2. ЗАГРУЗКА DISTILBERT ---
-print("⏳ Загрузка DistilBERT для векторизации...")
-# Принудительно используем CPU для стабильности вычислений (избегаем бага float32 на Apple MPS)
-device = torch.device('cpu') 
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+# --- 2. MAJESTIC MILLION ---
+# Загружается один раз при старте. Хранится в памяти как set — O(1) поиск.
+# Путь к файлу: majestic_million.csv, колонка 'Domain'
+MAJESTIC_PATH = "../project/csv/whitelist.csv"
+majestic_domains: set = set()
+
+try:
+    mm = pd.read_csv(MAJESTIC_PATH, usecols=['Domain'])
+    majestic_domains = set(mm['Domain'].str.lower().str.strip())
+    print(f"✅ Majestic Million: {len(majestic_domains):,} доменов")
+except Exception as e:
+    print(f"⚠️  Majestic Million не загружен: {e}")
+
+def get_root_domain(url: str) -> str:
+    ext = tldextract.extract(url)
+    if ext.domain and ext.suffix:
+        return f"{ext.domain}.{ext.suffix}".lower()
+    return (ext.domain or "").lower()
+
+# --- 3. BERT ---
+print("⏳ Загрузка DistilBERT...")
+device     = torch.device('cpu')
+tokenizer  = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 bert_model = AutoModel.from_pretrained("distilbert-base-uncased").to(device)
 bert_model.eval()
-print(f"✅ BERT готов (Устройство: {device})")
+print(f"✅ BERT готов")
 
+# --- 4. ТОКЕН ---
 API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
-    raise RuntimeError("API_TOKEN is not set in the environment variables")
+    raise RuntimeError("API_TOKEN не задан")
+
+LABEL_MAP = {0: "benign", 1: "phishing", 2: "malware", 3: "defacement"}
 
 def sign_response(payload: dict) -> str:
-    """Подпись ответа с использованием HMAC-SHA256 (надежный строковый метод)"""
-    secret = API_TOKEN.encode('utf-8')
-    # Склеиваем значения в жестком порядке: "status:detail:source"
-    raw_str = f"{payload.get('status', '')}:{payload.get('detail', '')}:{payload.get('source', '')}"
-    msg = raw_str.encode('utf-8')
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+    raw = f"{payload.get('status','')}:{payload.get('detail','')}:{payload.get('source','')}"
+    return hmac.new(API_TOKEN.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
-# Основной endpoint для проверки URL
+def bert_embed(text: str) -> np.ndarray:
+    enc = tokenizer([text], padding=True, truncation=True,
+                    max_length=128, return_tensors='pt').to(device)
+    with torch.no_grad():
+        vec = bert_model(**enc).last_hidden_state[:, 0, :]
+    return vec.cpu().numpy()  # (1, 768)
+
 @app.route('/check_url', methods=['POST'])
 @cross_origin()
 def check_url():
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_TOKEN}":
+    if request.headers.get("Authorization", "") != f"Bearer {API_TOKEN}":
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(force=True) or {}
-    url = data.get('url')
+    url  = data.get('url', '').strip()
     if not url:
         return jsonify({'error': 'URL not provided'}), 400
 
-    # --- ТОЛЬКО ЧЕСТНАЯ ПРОВЕРКА ЧЕРЕЗ НЕЙРОСЕТЬ (Без белых списков) ---
+    if url.startswith('chrome-extension') or url.endswith('.pkg'):
+        result = {'status': 'benign', 'detail': 'internal', 'source': 'system'}
+        result['signature'] = sign_response(result)
+        return jsonify(result), 200
+
     try:
-        # 1. Очистка URL (убираем мусор, чтобы было как в debug_model)
-        # Убираем http://, www., а также отрезаем все параметры после ? и #
-        clean_url = re.sub(r'^(https?://)?(www\.)?', '', url)
-        clean_url = clean_url.split('?')[0].split('#')[0].strip('/')
-        print(f"🔍 Проверка чистого URL: {clean_url}")
+        # ── УРОВЕНЬ 1: Majestic Million (репутация домена) ───────────────────
+        root = get_root_domain(url)
+        if root and root in majestic_domains:
+            print(f"🌐 Majestic hit: {root} → benign")
+            result = {'status': 'benign', 'detail': 'safe', 'source': 'majestic_million'}
+            result['signature'] = sign_response(result)
+            return jsonify(result), 200
 
-        # 2. Векторизация (кормим чистый URL)
-        encoded = tokenizer(
-            [clean_url], padding=True, truncation=True, max_length=64, return_tensors='pt'
-        ).to(device)
+        # ── УРОВЕНЬ 2: ML-классификатор ──────────────────────────────────────
+        vec_bert          = bert_embed(url)                                      # (1, 768)
+        vec_manual_raw    = np.array(get_feature_vector(url), dtype=np.float32).reshape(1, -1)
+        vec_manual_scaled = scaler.transform(vec_manual_raw)                     # (1, 18)
+        vec_final         = np.hstack((vec_bert, vec_manual_scaled))             # (1, 786)
 
-        with torch.no_grad():
-            output = bert_model(**encoded)
+        pred_int = int(pipeline.predict(vec_final)[0])
+        status   = LABEL_MAP.get(pred_int, "unknown")
+        detail   = status if status != "benign" else "safe"
 
-        # Получаем чистый вектор
-        vec = output.last_hidden_state[:, 0, :].cpu().numpy()
+        print(f"🧠 ML: {pred_int} → {status} | {url}")
 
-        # 3. Предсказание (ЧИСТЫЙ МАССИВ, НИКАКОГО PANDAS!)
-        pred_int = int(pipeline.predict(vec)[0])
-
-        if pred_int == 0:
-            status = "benign"
-            detail = "safe"
-        elif pred_int == 1:
-            status = "malicious"
-            detail = "phishing"
-        elif pred_int == 2:
-            status = "malicious"
-            detail = "malware"
-        elif pred_int == 3:
-            status = "malicious"
-            detail = "defacement"
-        else:
-            status = "unknown"
-            detail = "unknown"
-
-        result = {
-            'status': status, 
-            'detail': detail,
-            'source': 'hybrid_model'
-        }
-
-        # 4. Собираем подпись без пробелов
-        raw_str = f"{result['status']}:{result['detail']}:{result['source']}"
-        secret = API_TOKEN.encode('utf-8')
-        result['signature'] = hmac.new(secret, raw_str.encode('utf-8'), hashlib.sha256).hexdigest()
-
+        result = {'status': status, 'detail': detail, 'source': 'hybrid_model'}
+        result['signature'] = sign_response(result)
         return jsonify(result), 200
 
     except Exception as e:
-        print(f"❌ Ошибка при обработке {url}: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"❌ Ошибка {url}: {e}")
+        return jsonify({'error': str(e), 'status': 'unknown'}), 500
 
 if __name__ == '__main__':
     app.run(port=5000, debug=False)

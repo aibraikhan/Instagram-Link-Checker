@@ -1,27 +1,32 @@
-
 from __future__ import annotations
 import re, ipaddress
-from difflib import SequenceMatcher
 from urllib.parse import urlparse as _std_urlparse
 from tldextract import extract as tld_extract
 
 def safe_urlparse(u: str):
-    """
-    Обёртка над urlparse, чтобы не падать на кривых строках.
-    Возвращаем объект с полями .scheme, .hostname, .netloc,
-    даже если строка была невалидной.
-    """
     try:
         return _std_urlparse(u)
     except Exception:
-        # вернём пустые поля, чтобы последующий код не умер
         class Dummy:
-            scheme = ""
-            hostname = ""
-            netloc = ""
+            scheme = ""; hostname = ""; netloc = ""; path = ""; query = ""
         return Dummy()
 
-# топ укоротителей из твоего 2_api.py
+def split_url(url: str) -> tuple[str, str]:
+    """
+    Разбивает URL на (домен, путь). Работает с протоколом и без.
+    'egov.kz/cms/ru'         -> ('egov.kz', '/cms/ru')
+    'https://egov.kz/cms/ru' -> ('egov.kz', '/cms/ru')
+    """
+    u = url or ""
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://', u):
+        u = "http://" + u
+    p = safe_urlparse(u)
+    domain = (p.hostname or "").lower()
+    path   = p.path or ""
+    if p.query:
+        path += "?" + p.query
+    return domain, path
+
 SHORT_SVC = {
     'bit','goo','tinyurl','ow','t','is','cli','yfrog','migre','ff','url4',
     'twit','su','snipurl','short','budurl','ping','post','just','bkite',
@@ -30,87 +35,112 @@ SHORT_SVC = {
     'buzurl','cutt','yourls','x'
 }
 
-def has_shortening_service(url: str) -> int:
-    m = re.search(r'https?://(?:www\.)?(?:[\w-]+\.)*([\w-]+)\.', url or "")
-    if not m:
-        return 0
-    return int(m.group(1).lower() in SHORT_SVC)
+PATH_SUSPICIOUS = [
+    'login','signin','verify','update','secure','confirm','password',
+    'credential','download','install','payload','cmd','exec','eval',
+    'base64','redirect','wp-admin','phpmyadmin','admin','shell',
+    '.exe','.php','.bat','.sh','.js','free','gift','prize','winner',
+    'lucky','click','limited','offer','index.php'
+]
 
-def abnormal_url(url: str) -> int:
-    h = safe_urlparse(url or "").netloc or ""
-    return int(bool(h and h not in (url or "")))
+DOMAIN_SUSPICIOUS = [
+    'secure','login','bank','account','update','verify','free',
+    'lucky','prize','paypal','amazon','apple','google','microsoft',
+    'ebay','netflix','support','help','service'
+]
 
-def secure_http(url: str) -> int:
-    return int((safe_urlparse(url or "").scheme or "").lower() == "https")
+# ── ПРИЗНАКИ ДОМЕНА (стабильные — не меняются при смене пути) ──────────────
 
-def have_ip_address(url: str) -> int:
-    h = safe_urlparse(url or "").hostname or ""
-    try:
-        ipaddress.ip_address(h)
-        return 1
-    except Exception:
-        return 0
-
-def url_len(url: str) -> int:
-    return len((url or "").replace("http://","").replace("https://",""))
-
-def count_chars(url: str):
-    s = url or ""
-    letters = sum(c.isalpha() for c in s)
-    digits  = sum(c.isdigit() for c in s)
-    specials= sum(not (c.isalnum()) for c in s)
-    return letters, digits, specials
-
-def registrable_domain(url: str) -> str:
-    ext = tld_extract(url or "")
-    if ext.suffix:
-        return f"{ext.domain}.{ext.suffix}".lower() if ext.domain else ext.suffix.lower()
-    return (ext.domain or "unknown").lower()
-
-def tld_length(url: str) -> int:
-    ext = tld_extract(url or "")
-    return len(ext.suffix or "")
-
-def url_region_hash(url: str) -> int:
-    # как в testing/train_full_model.py: простая детерминированная хеш-фича корневого домена
-    ext = tld_extract(url or "")
-    parts = [p for p in [ext.domain, ext.suffix] if p]
-    root = ".".join(parts) if parts else (ext.domain or "")
-    h = 0
-    for ch in root:
-        h = ((h << 5) - h) + ord(ch)
-        h &= 0xFFFFFFFF
-    return abs(h) % 100000000
-
-def netloc_hash(url: str) -> int:
-    host = safe_urlparse(url or "").hostname or ""
-    h = 0
-    for ch in host:
-        h = ((h << 5) - h) + ord(ch)
-        h &= 0xFFFFFFFF
-    return abs(h) % 100000000
-
-def get_feature_vector(url: str) -> list[float]:
-    """Возвращает фич-вектор (ровно 12 признаков) в фиксированном порядке."""
+def get_domain_features(url: str) -> list[float]:
+    """
+    10 признаков ТОЛЬКО доменной части.
+    egov.kz/cms/ru и egov.kz/login -> ОДИНАКОВЫЙ вектор домена.
+    """
+    domain, _ = split_url(url)
     u = url or ""
-    p = safe_urlparse(u)
+    ext = tld_extract(u)
 
-    L = sum(c.isalpha() for c in u)
-    D = sum(c.isdigit() for c in u)
-    S = sum(not c.isalnum() for c in u)
+    is_ip = 0
+    try:
+        ipaddress.ip_address(domain); is_ip = 1
+    except Exception:
+        pass
+
+    subdomain_count    = len(ext.subdomain.split('.')) if ext.subdomain else 0
+    u_norm = u if re.match(r'^[a-zA-Z]+://', u) else "http://" + u
+    is_https           = int(safe_urlparse(u_norm).scheme.lower() == "https")
+    suspicious_domain  = sum(1 for w in DOMAIN_SUSPICIOUS if w in domain)
+    is_shortened       = int(any(s == (ext.domain or "").lower() for s in SHORT_SVC))
 
     return [
-        url_len(url),              # 1
-        L,                         # 2
-        D,                         # 3
-        S,                         # 4
-        has_shortening_service(url),#5
-        abnormal_url(url),         # 6
-        secure_http(url),          # 7
-        have_ip_address(url),      # 8
-        tld_length(url),           # 9
-        url_region_hash(url),      # 10
-        netloc_hash(url),          # 11
-        # бонус-фича: кол-во точек в хосте (стабильно и дёшево)
-        (p.hostname or "").count("."),   # кол-во точек в хосте, # 12
+        len(ext.domain or ""),                          # 1. Длина имени домена
+        len(ext.suffix or ""),                          # 2. Длина TLD
+        subdomain_count,                                # 3. Кол-во поддоменов
+        domain.count('.'),                              # 4. Кол-во точек
+        (ext.domain or "").count('-'),                  # 5. Тире в домене
+        int(bool(re.search(r'\d', ext.domain or ""))), # 6. Цифры в домене
+        is_ip,                                          # 7. IP вместо домена
+        is_shortened,                                   # 8. Сервис сокращения
+        suspicious_domain,                              # 9. Подозрит. слова в домене
+        is_https,                                       # 10. HTTPS
     ]
+
+# ── ПРИЗНАКИ ПУТИ (меняются при смене пути — именно это и нужно) ──────────
+
+def get_path_features(url: str) -> list[float]:
+    """
+    8 признаков ТОЛЬКО пути/query.
+    egov.kz/cms/ru и egov.kz/login -> РАЗНЫЕ векторы пути.
+    """
+    _, path = split_url(url)
+
+    dangerous_ext = int(bool(re.search(
+        r'\.(exe|php|bat|sh|py|js|vbs|cmd|msi|apk|dmg|ps1)(\?|$|#)',
+        path.lower()
+    )))
+    suspicious_path = sum(1 for w in PATH_SUSPICIOUS if w in path.lower())
+    has_base64 = int(bool(re.search(r'[A-Za-z0-9+/]{20,}={0,2}', path)))
+
+    return [
+        len(path),                                          # 1. Длина пути
+        path.count('/'),                                    # 2. Глубина
+        sum(c.isdigit() for c in path),                    # 3. Цифры в пути
+        sum(not c.isalnum() and c not in '/-_.' for c in path), # 4. Спецсимволы
+        dangerous_ext,                                      # 5. Опасное расширение
+        suspicious_path,                                    # 6. Подозрит. слова
+        path.count('%'),                                    # 7. % кодирование
+        has_base64,                                         # 8. Base64 строки
+    ]
+
+# ── ИТОГ: 10 + 8 = 18 признаков ────────────────────────────────────────────
+
+def get_feature_vector(url: str) -> list[float]:
+    return get_domain_features(url) + get_path_features(url)
+
+
+if __name__ == "__main__":
+    import pandas as pd
+    import numpy as np
+    from tqdm import tqdm
+    import os
+
+    BASE_DIR = '../project/csv'
+    FILES    = ['train.csv', 'test.csv']
+
+    for file_name in FILES:
+        input_path = os.path.join(BASE_DIR, file_name)
+        prefix     = file_name.split('.')[0]
+        out_path   = os.path.join(BASE_DIR, f'{prefix}_manual_features.npy')
+
+        print(f"\n{'='*45}\nПризнаки: {file_name}\n{'='*45}")
+        if not os.path.exists(input_path):
+            print(f"❌ Не найден: {input_path}"); continue
+
+        df   = pd.read_csv(input_path)
+        urls = df['url'].astype(str).tolist()
+        X    = np.array([get_feature_vector(u) for u in tqdm(urls, desc=prefix)],
+                        dtype=np.float32)
+
+        print(f"✅ Размерность: {X.shape}  (должно быть [..., 18])")
+        np.save(out_path, X)
+        print(f"💾 {out_path}")

@@ -1,55 +1,53 @@
 import pandas as pd
+import re
+from sklearn.model_selection import GroupShuffleSplit
 
 # НАСТРОЙКИ ПУТЕЙ
-MAIN_DATASET = '/Users/alinur/Documents/code for diss/Instagram-Link-Checker/project/py/malicious_phish.csv'
-BENIGN_1M_FILE = '/Users/alinur/Documents/code for diss/Instagram-Link-Checker/project/py/whitelist.csv' # <--- УКАЖИ ПУТЬ К ФАЙЛУ С 1 МЛН
-OUTPUT_FILE = '/Users/alinur/Documents/code for diss/Instagram-Link-Checker/project/py/dataset_final_augmented.csv'
+FILE_PATH = './project/py/dataset_final_augmented.csv'
+# NEW_DATASET_PATH = './project/py/phishing_site_urls.csv'
+# OUTPUT_PATH = '/project/py/dataset_final_balanced.csv'
 
-# 1. Загружаем основной датасет
-print("Загружаем основной датасет...")
-try:
-    df_main = pd.read_csv(MAIN_DATASET)
-    print(f"Основной: {df_main.shape[0]} строк")
-except Exception as e:
-    print(f"Ошибка открытия основного файла: {e}")
-    exit()
 
-# 2. Загружаем список 1 млн benign (предполагаем, что там нет заголовка или колонка называется 'domain')
-print("Загружаем список 1 млн...")
-try:
-    # Если в файле нет заголовков, используем header=None и даем имя колонке 'url'
-    # Если заголовок есть, pandas сам поймет, но лучше переименовать в 'url' для совместимости
-    df_1m = pd.read_csv(BENIGN_1M_FILE)
-    
-    # Если колонка называется 'domain', переименуем в 'url'
-    if 'domain' in df_1m.columns:
-        df_1m.rename(columns={'domain': 'url'}, inplace=True)
-    elif df_1m.shape[1] == 1:
-        df_1m.columns = ['url'] # Если колонка одна без названия
-        
-    print(f"Доп. список: {df_1m.shape[0]} строк")
-except Exception as e:
-    print(f"Ошибка открытия файла с 1 млн: {e}")
-    exit()
+print("⏳ Загружаем финальный датасет...")
+df = pd.read_csv(FILE_PATH)
+df['url'] = df['url'].astype(str)
 
-# 3. Фильтруем ТОЛЬКО .kz из миллионника
-print("Ищем .kz домены в списке миллионнике...")
-kz_aug = df_1m[df_1m['url'].astype(str).str.endswith('.kz', na=False)].copy()
+print("🔍 Извлекаем корневые домены для группировки...")
+# Так как мы уже вырезали http:// и www., корень домена — это всё до первого слэша '/'
+df['domain'] = df['url'].apply(lambda x: x.split('/')[0])
 
-# Добавляем метку benign
-# Проверяем как в основном файле называется колонка меток (type или label)
-target_col = 'type' if 'type' in df_main.columns else 'label'
-kz_aug[target_col] = 'benign'
+print(f"📊 Найдено уникальных доменов: {df['domain'].nunique()}")
 
-print(f"Найдено хороших .kz доменов: {len(kz_aug)}")
+print("🔀 Разделяем данные (80% Train / 20% Test) с изоляцией доменов...")
+# n_splits=1 означает, что нам нужно только одно разбиение
+# random_state=42 гарантирует, что каждый раз при запуске разбиение будет одинаковым (воспроизводимость)
+gss = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=42)
 
-# 4. Объединяем
-df_final = pd.concat([df_main, kz_aug], ignore_index=True)
+# Получаем индексы строк для Train и Test
+train_idx, test_idx = next(gss.split(df, groups=df['domain']))
 
-# Удаляем дубликаты
-df_final.drop_duplicates(subset=['url'], inplace=True)
+train_df = df.iloc[train_idx].copy()
+test_df = df.iloc[test_idx].copy()
 
-# 5. Сохраняем
-df_final.to_csv(OUTPUT_FILE, index=False)
-print(f"✅ Готово! Финальный датасет сохранен: {OUTPUT_FILE}")
-print(f"Новый размер: {df_final.shape[0]}")
+print("\n📈 Статистика разделения:")
+print(f"Обучающая выборка (Train): {len(train_df)} строк")
+print(f"Тестовая выборка (Test): {len(test_df)} строк")
+
+print("\n🛡️ Проверка пересечения доменов (Data Leakage Check):")
+train_domains = set(train_df['domain'])
+test_domains = set(test_df['domain'])
+overlap = train_domains.intersection(test_domains)
+
+if len(overlap) == 0:
+    print("✅ Идеально! Утечек данных нет. Ни один домен не попал одновременно в обе выборки.")
+else:
+    print(f"⚠️ ВНИМАНИЕ: Найдено {len(overlap)} пересекающихся доменов.")
+
+# Удаляем вспомогательную колонку domain перед сохранением
+train_df = train_df.drop(columns=['domain'])
+test_df = test_df.drop(columns=['domain'])
+
+print("\n💾 Сохраняем файлы...")
+train_df.to_csv('./project/py/train.csv', index=False)
+test_df.to_csv('./project/py/test.csv', index=False)
+print("🎉 Готово! Файлы train.csv и test.csv созданы и полностью готовы к машинному обучению.")
